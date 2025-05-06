@@ -15,16 +15,19 @@
 // Ajout de l'inclusion pour jpg2rgb565
 #include "esp_jpg_decode.h"
 
-// Déclaration externe de jpg2rgb565 si nécessaire
+// Déclaration pour jpg2rgb565 si non déclaré ailleurs
+#ifndef JPG_SCALE_NONE
+typedef enum {
+  JPG_SCALE_NONE,
+  JPG_SCALE_2X,
+  JPG_SCALE_4X,
+  JPG_SCALE_8X,
+} jpg_scale_t;
+
 extern "C" {
   bool jpg2rgb565(const uint8_t *src, size_t src_len, uint8_t *out, jpg_scale_t scale);
-  enum jpg_scale_t {
-    JPG_SCALE_NONE,
-    JPG_SCALE_2X,
-    JPG_SCALE_4X,
-    JPG_SCALE_8X,
-  };
 }
+#endif
 
 namespace esphome {
 namespace video_player {
@@ -146,7 +149,7 @@ bool VideoPlayerComponent::open_http_source() {
   
   ESP_LOGI(TAG, "Connecting to HTTP source: %s", this->http_url_);
 
-  // Configuration du client HTTP - corrigé l'ordre des champs
+  // Configuration du client HTTP - initialiser à zéro et définir chaque champ individuellement
   esp_http_client_config_t config = {};
   config.url = this->http_url_;
   config.event_handler = http_event_handler;
