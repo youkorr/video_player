@@ -1,5 +1,4 @@
 #pragma once
-
 #include "esphome/core/component.h"
 #include "esphome/components/display/display_buffer.h"
 #include "esphome/components/api/api_server.h"
@@ -26,7 +25,6 @@ class VideoPlayerComponent : public Component {
     http_url_ = url; 
     source_ = VideoSource::HTTP;
   }
-
  protected:
   bool open_file_source();
   bool open_http_source();
