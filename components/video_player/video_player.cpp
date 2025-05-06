@@ -1,7 +1,6 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 #include "video_player.h"
-#include "esp_jpg_decode.h"
 
 // Inclusions pour ESP-IDF 5.1.5
 #include "esp_vfs.h"
@@ -12,6 +11,20 @@
 // Pour la lecture du fichier MJPEG
 #include <stdio.h>
 #include <string.h>
+
+// Ajout de l'inclusion pour jpg2rgb565
+#include "esp_jpg_decode.h"
+
+// Déclaration externe de jpg2rgb565 si nécessaire
+extern "C" {
+  bool jpg2rgb565(const uint8_t *src, size_t src_len, uint8_t *out, jpg_scale_t scale);
+  enum jpg_scale_t {
+    JPG_SCALE_NONE,
+    JPG_SCALE_2X,
+    JPG_SCALE_4X,
+    JPG_SCALE_8X,
+  };
+}
 
 namespace esphome {
 namespace video_player {
@@ -133,13 +146,12 @@ bool VideoPlayerComponent::open_http_source() {
   
   ESP_LOGI(TAG, "Connecting to HTTP source: %s", this->http_url_);
 
-  // Configuration du client HTTP
-  esp_http_client_config_t config = {
-    .url = this->http_url_,
-    .event_handler = http_event_handler,
-    .user_data = this,
-    .timeout_ms = 10000,
-  };
+  // Configuration du client HTTP - corrigé l'ordre des champs
+  esp_http_client_config_t config = {};
+  config.url = this->http_url_;
+  config.event_handler = http_event_handler;
+  config.user_data = this;
+  config.timeout_ms = 10000;
   
   esp_http_client_handle_t client = esp_http_client_init(&config);
   if (client == NULL) {
