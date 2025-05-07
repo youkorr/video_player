@@ -1,181 +1,132 @@
 #include "video_player.h"
 #include "esp_http_client.h"
-#include "esp_camera.h"
 #include "esp_heap_caps.h"
-#include "esp_timer.h"
+#include "esp_jpg_decode.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 namespace esphome {
 namespace video_player {
 
-static const char *TAG = "video_player";
+static const char *TAG = "video.player";
 
-void VideoPlayerComponent::setup() {
-  if (this->display_ == nullptr) {
-    ESP_LOGE(TAG, "Display not set!");
-    this->mark_failed();
-    return;
-  }
-
-  ESP_LOGI(TAG, "MJPEG raw stream player ready");
-  ESP_LOGI(TAG, "Display dimensions: %dx%d", 
-           display_->get_width(), display_->get_height());
-}
-
-bool VideoPlayerComponent::process_raw_mjpeg(const uint8_t* data, size_t len) {
-  // Recherche du marqueur JPEG de début (0xFFD8)
-  const uint8_t* jpeg_start = nullptr;
-  for (size_t i = 0; i < len - 1; i++) {
-    if (data[i] == 0xFF && data[i+1] == 0xD8) {
-      jpeg_start = data + i;
-      break;
-    }
-  }
-
-  if (!jpeg_start) {
-    ESP_LOGD(TAG, "No JPEG start marker found");
-    return false;
-  }
-
-  // Recherche du marqueur JPEG de fin (0xFFD9)
-  const uint8_t* jpeg_end = nullptr;
-  for (size_t i = (jpeg_start - data); i < len - 1; i++) {
-    if (data[i] == 0xFF && data[i+1] == 0xD9) {
-      jpeg_end = data + i + 2;
-      break;
-    }
-  }
-
-  if (!jpeg_end) {
-    ESP_LOGD(TAG, "No JPEG end marker found");
-    return false;
-  }
-
-  size_t jpeg_size = jpeg_end - jpeg_start;
-  ESP_LOGD(TAG, "Found JPEG frame: %d bytes", jpeg_size);
-
-  // Effacer l'écran avant d'afficher la nouvelle image
-  display_->fill(COLOR_BLACK);
-
-  // Traitement du frame JPEG
-  return process_frame(jpeg_start, jpeg_size);
-}
-
-bool VideoPlayerComponent::process_frame(const uint8_t* jpeg_data, size_t jpeg_size) {
-  // Configuration pour la décodage JPEG
-  camera_fb_t fb;
-  fb.buf = (uint8_t*)jpeg_data;
-  fb.len = jpeg_size;
-  fb.width = display_->get_width();
-  fb.height = display_->get_height();
-  fb.format = PIXFORMAT_JPEG;
-
-  // Allouer un buffer pour l'image décodée
-  uint8_t *rgb_buf = (uint8_t *)heap_caps_malloc(
-    display_->get_width() * display_->get_height() * 2,
-    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-  );
-
-  if (!rgb_buf) {
-    ESP_LOGE(TAG, "Failed to allocate RGB buffer");
-    return false;
-  }
-
-  // Décoder le JPEG
-  bool decoded = fmt2rgb888(&fb, PIXFORMAT_RGB565, rgb_buf);
-  if (!decoded) {
-    ESP_LOGE(TAG, "JPEG decoding failed");
-    heap_caps_free(rgb_buf);
-    return false;
-  }
-
-  // Afficher l'image
-  for (int y = 0; y < display_->get_height(); y++) {
-    for (int x = 0; x < display_->get_width(); x++) {
-      int idx = (y * display_->get_width() + x) * 2;
-      uint16_t pixel = (rgb_buf[idx+1] << 8) | rgb_buf[idx];
-      uint8_t r = ((pixel >> 11) & 0x1F) << 3;
-      uint8_t g = ((pixel >> 5) & 0x3F) << 2;
-      uint8_t b = (pixel & 0x1F) << 3;
-      display_->draw_pixel_at(x, y, Color(r, g, b));
-    }
-  }
-
-  heap_caps_free(rgb_buf);
-  return true;
-}
-
-esp_err_t VideoPlayerComponent::http_event_handler(esp_http_client_event_t *evt) {
-  VideoPlayerComponent* player = static_cast<VideoPlayerComponent*>(evt->user_data);
+static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
+  auto *player = static_cast<VideoPlayerComponent *>(evt->user_data);
   
-  switch(evt->event_id) {
+  switch (evt->event_id) {
     case HTTP_EVENT_ON_DATA:
-      if (!player->process_raw_mjpeg((const uint8_t*)evt->data, evt->data_len)) {
-        ESP_LOGW(TAG, "Failed to process MJPEG frame");
-      }
+      player->process_mjpeg_chunk((uint8_t *)evt->data, evt->data_len);
       break;
-      
-    case HTTP_EVENT_DISCONNECTED:
-      ESP_LOGD(TAG, "HTTP disconnected");
-      player->http_initialized_ = false;
-      break;
-      
-    case HTTP_EVENT_ERROR:
-      ESP_LOGE(TAG, "HTTP error");
-      player->http_initialized_ = false;
-      break;
-      
     default:
       break;
   }
   return ESP_OK;
 }
 
-void VideoPlayerComponent::loop() {
-  const uint32_t now = millis();
-  
-  // Initialisation HTTP si nécessaire
-  if (source_ == VideoSource::HTTP && !http_initialized_) {
-    if (now - last_http_init_attempt_ > 5000) {
-      last_http_init_attempt_ = now;
-      
-      esp_http_client_config_t config = {
-        .url = http_url_,
-        .event_handler = http_event_handler,
-        .user_data = this,
-        .timeout_ms = 5000,
-        .buffer_size = 4096
-      };
-      
-      esp_http_client_handle_t client = esp_http_client_init(&config);
-      if (client) {
-        esp_err_t err = esp_http_client_perform(client);
-        if (err != ESP_OK) {
-          ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
-        }
-        esp_http_client_cleanup(client);
-      }
-    }
+void VideoPlayerComponent::setup() {
+  ESP_LOGI(TAG, "Initializing MJPEG Player");
+  if (parent_ == nullptr) {
+    ESP_LOGE(TAG, "No display configured!");
+    mark_failed();
     return;
   }
-  
-  // Mise à jour périodique
-  if (now - last_update_ < update_interval_) {
-    return;
-  }
-  last_update_ = now;
-  
-  display_->update();
 }
 
-void VideoPlayerComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "MJPEG Raw Stream Player:");
-  ESP_LOGCONFIG(TAG, "  Source: %s", source_ == VideoSource::FILE ? "File" : "HTTP");
-  if (source_ == VideoSource::HTTP) {
-    ESP_LOGCONFIG(TAG, "  URL: %s", http_url_);
-  } else {
-    ESP_LOGCONFIG(TAG, "  File: %s", video_path_);
+bool VideoPlayerComponent::process_mjpeg_chunk(const uint8_t *data, size_t len) {
+  static uint8_t *jpg_buf = nullptr;
+  static size_t jpg_size = 0;
+  
+  // Recherche du marqueur JPEG (0xFFD8)
+  for (size_t i = 0; i < len - 1; i++) {
+    if (data[i] == 0xFF && data[i + 1] == 0xD8) {
+      // Trouvé un nouveau frame, traiter le précédent s'il existe
+      if (jpg_buf != nullptr && jpg_size > 0) {
+        decode_jpeg(jpg_buf, jpg_size);
+        free(jpg_buf);
+      }
+      
+      // Allouer buffer pour nouveau frame
+      jpg_size = len - i;
+      jpg_buf = (uint8_t *)malloc(jpg_size);
+      if (!jpg_buf) {
+        ESP_LOGE(TAG, "Memory allocation failed");
+        return false;
+      }
+      memcpy(jpg_buf, data + i, jpg_size);
+      return true;
+    }
+  }
+  
+  // Ajouter des données au frame en cours
+  if (jpg_buf != nullptr) {
+    uint8_t *tmp = (uint8_t *)realloc(jpg_buf, jpg_size + len);
+    if (!tmp) {
+      free(jpg_buf);
+      jpg_buf = nullptr;
+      return false;
+    }
+    jpg_buf = tmp;
+    memcpy(jpg_buf + jpg_size, data, len);
+    jpg_size += len;
+  }
+  
+  return true;
+}
+
+bool VideoPlayerComponent::decode_jpeg(const uint8_t *src, size_t len) {
+  const int width = parent_->get_width();
+  const int height = parent_->get_height();
+  uint8_t *rgb_buf = (uint8_t *)heap_caps_malloc(width * height * 2, MALLOC_CAP_SPIRAM);
+  
+  if (!rgb_buf) {
+    ESP_LOGE(TAG, "RGB buffer allocation failed");
+    return false;
+  }
+
+  bool decoded = jpg2rgb565(src, len, rgb_buf, JPG_SCALE_NONE);
+  if (!decoded) {
+    ESP_LOGE(TAG, "JPEG decode failed");
+    free(rgb_buf);
+    return false;
+  }
+
+  // Afficher l'image
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = (y * width + x) * 2;
+      uint16_t pixel = (rgb_buf[idx + 1] << 8) | rgb_buf[idx];
+      parent_->draw_pixel_at(x, y, Color(
+        ((pixel >> 11) & 0x1F) << 3,
+        ((pixel >> 5) & 0x3F) << 2,
+        (pixel & 0x1F) << 3
+      ));
+    }
+  }
+
+  free(rgb_buf);
+  parent_->update();
+  return true;
+}
+
+void VideoPlayerComponent::loop() {
+  if (millis() - last_update_ < update_interval_ || failed()) {
+    return;
+  }
+  last_update_ = millis();
+
+  if (!initialized_) {
+    esp_http_client_config_t config = {
+      .url = url_,
+      .event_handler = http_event_handler,
+      .user_data = this,
+      .buffer_size = 4096
+    };
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client) {
+      initialized_ = true;
+      esp_http_client_perform(client);
+      esp_http_client_cleanup(client);
+    }
   }
 }
 
