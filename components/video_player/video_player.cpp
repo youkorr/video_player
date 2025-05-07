@@ -705,48 +705,133 @@ bool VideoPlayerComponent::process_frame(const uint8_t* jpeg_data, size_t jpeg_s
   return conversion_success;
 }
 
-void VideoPlayerComponent::loop() {
-  const uint32_t now = millis();
-  
-  // Vérifier si HTTP a besoin d'initialisation
-  if (this->source_ == VideoSource::HTTP && !this->http_initialized_) {
-    if (now - last_http_init_attempt_ > 5000) { // Essayer toutes les 5 secondes
-      last_http_init_attempt_ = now;
-      if (this->open_http_source()) {
-        this->http_initialized_ = true;
-        ESP_LOGI(TAG, "HTTP source initialized successfully");
-      } else {
-        ESP_LOGW(TAG, "HTTP initialization deferred, will retry");
-        return;
-      }
-    } else {
-      // Pas encore le moment de réessayer
-      return;
-    }
-  }
-  
-  if (now - last_update_ < update_interval_) {
+void VideoPlayer::loop() {
+  if (!this->enabled_ || this->is_playing_) return;
+
+  this->is_playing_ = true;
+
+  esp_http_client_config_t config = {
+    .url = this->video_url_.c_str(),
+    .timeout_ms = 5000,
+    .buffer_size = 16 * 1024,
+    .event_handler = http_event_handler,
+    .user_data = this
+  };
+
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == nullptr) {
+    ESP_LOGE(TAG, "Échec init client HTTP");
+    this->is_playing_ = false;
     return;
   }
-  last_update_ = now;
-  
-  // Cession de tâche plus longue pour éviter d'affamer la pile réseau
-  vTaskDelay(pdMS_TO_TICKS(5));
-  
-  // Réinitialiser le watchdog avant le traitement du frame
-  esp_task_wdt_reset();
-  
-  if (read_next_frame()) {
-    display_->update();
-    this->current_frame_++;
-    
-    // Pour déboguer la mémoire
-    if (this->current_frame_ % 100 == 0) {
-      ESP_LOGI(TAG, "Memory - Free: %u bytes, Min Free: %u bytes",
-               esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+
+  esp_err_t err = esp_http_client_open(client, 0);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Erreur ouverture HTTP: %s", esp_err_to_name(err));
+    esp_http_client_cleanup(client);
+    this->is_playing_ = false;
+    return;
+  }
+
+  int content_length = esp_http_client_fetch_headers(client);
+  if (content_length <= 0) {
+    ESP_LOGW(TAG, "Longueur de contenu inconnue ou nulle");
+  }
+
+  uint8_t header_buf[4];
+  int read = esp_http_client_read(client, (char *) header_buf, 4);
+  if (read != 4) {
+    ESP_LOGE(TAG, "Impossible de lire signature");
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    this->is_playing_ = false;
+    return;
+  }
+
+  bool is_custom_mjpeg = false;
+  if (memcmp(header_buf, "MJPG", 4) == 0) {
+    ESP_LOGI(TAG, "MJPEG personnalisé détecté");
+    is_custom_mjpeg = true;
+  } else if (header_buf[0] == 0xFF && header_buf[1] == 0xD8) {
+    ESP_LOGI(TAG, "MJPEG brut détecté (flux JPEG)");
+    is_custom_mjpeg = false;
+  } else {
+    ESP_LOGE(TAG, "Signature MJPEG invalide: 0x%02X%02X%02X%02X", header_buf[0], header_buf[1], header_buf[2], header_buf[3]);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    this->is_playing_ = false;
+    return;
+  }
+
+  if (!is_custom_mjpeg) {
+    // Lecture brute de JPEGs en boucle
+    const int max_frame_size = 60 * 1024;
+    uint8_t *jpeg_buf = (uint8_t *) malloc(max_frame_size);
+
+    if (!jpeg_buf) {
+      ESP_LOGE(TAG, "Échec allocation JPEG");
+      esp_http_client_close(client);
+      esp_http_client_cleanup(client);
+      this->is_playing_ = false;
+      return;
+    }
+
+    int pos = 0;
+    jpeg_buf[0] = header_buf[0];
+    jpeg_buf[1] = header_buf[1];
+    pos = 2;
+
+    while (true) {
+      char c;
+      int r = esp_http_client_read(client, &c, 1);
+      if (r <= 0) break;
+
+      jpeg_buf[pos++] = c;
+      if (pos >= 2 && jpeg_buf[pos - 2] == 0xFF && jpeg_buf[pos - 1] == 0xD9) {
+        // FIN JPEG
+        jpg2rgb565(jpeg_buf, pos, this->frame_buffer_, JPG_SCALE_NONE);
+        this->display_->draw(this->frame_buffer_);
+        pos = 0;
+        delay(this->frame_delay_);
+      }
+
+      if (pos >= max_frame_size - 1) pos = 0; // évite dépassement
+    }
+
+    free(jpeg_buf);
+  } else {
+    // Format MJPEG personnalisé
+    while (true) {
+      mjpeg_frame_header_t frame_header;
+      int r = esp_http_client_read(client, (char *) &frame_header, sizeof(frame_header));
+      if (r <= 0) break;
+      if (frame_header.size == 0 || frame_header.size > 100 * 1024) break;
+
+      uint8_t *jpeg_buf = (uint8_t *) malloc(frame_header.size);
+      if (!jpeg_buf) break;
+
+      int received = 0;
+      while (received < frame_header.size) {
+        int chunk = esp_http_client_read(client, (char *) jpeg_buf + received, frame_header.size - received);
+        if (chunk <= 0) break;
+        received += chunk;
+      }
+
+      if (received == frame_header.size) {
+        jpg2rgb565(jpeg_buf, frame_header.size, this->frame_buffer_, JPG_SCALE_NONE);
+        this->display_->draw(this->frame_buffer_);
+        delay(this->frame_delay_);
+      }
+
+      free(jpeg_buf);
     }
   }
+
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+  this->is_playing_ = false;
 }
+
 
 void VideoPlayerComponent::dump_info() {
   ESP_LOGCONFIG(TAG, "Video Player:");
