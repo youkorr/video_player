@@ -393,99 +393,6 @@ bool VideoPlayerComponent::open_http_source() {
   
   ESP_LOGI(TAG, "Video parameters: %dx%d, %d frames, %d FPS", 
            this->video_width_, this->video_height_, this->frame_count_, this->video_fps_);
-  
-  // Utiliser une taille de buffer raisonnable basée sur la longueur du contenu et la mémoire disponible
-  size_t target_buffer_size = std::min((size_t)content_length, (size_t)65536);  // Max 64KB ou longueur du contenu
-  
-  // Vérifier la mémoire libre et ajuster la taille du buffer si nécessaire
-  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  ESP_LOGI(TAG, "Free memory - Internal: %u bytes, SPIRAM: %u bytes", free_internal, free_spiram);
-  
-  // Limiter la taille du buffer pour éviter les problèmes de mémoire
-  if (target_buffer_size > free_internal / 2 && target_buffer_size > free_spiram / 4) {
-    target_buffer_size = std::min(free_internal / 2, free_spiram / 4);
-    ESP_LOGW(TAG, "Limiting buffer size to %u bytes due to memory constraints", target_buffer_size);
-  }
-  
-  // Assurer une taille minimale viable
-  if (target_buffer_size < 8192) {
-    target_buffer_size = 8192;  // Minimum 8KB
-  }
-  
-  // Maintenant allouer le buffer HTTP réel
-  this->http_buffer_size_ = target_buffer_size;
-  this->http_buffer_ = (uint8_t*)heap_caps_malloc(this->http_buffer_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!this->http_buffer_) {
-    ESP_LOGW(TAG, "Failed to allocate from SPIRAM, trying internal memory");
-    this->http_buffer_ = (uint8_t*)heap_caps_malloc(this->http_buffer_size_, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!this->http_buffer_) {
-      ESP_LOGE(TAG, "Failed to allocate HTTP buffer");
-      esp_http_client_close(client);
-      return false;
-    }
-  }
-  
-  // Copier l'en-tête dans le buffer
-  memcpy(this->http_buffer_, header, sizeof(mjpeg_header_t));
-  size_t buffer_pos = sizeof(mjpeg_header_t);
-  
-  // Calculer l'intervalle entre les frames basé sur le FPS
-  if (this->update_interval_ == 0) {
-    this->update_interval_ = 1000 / this->video_fps_;
-  }
-  
-  // Lire les données en petits morceaux avec des timeouts
-  const size_t chunk_size = 4096;  // Morceaux de 4 Ko
-  int total_chunks = 0;
-  bool read_timed_out = false;
-  
-  // Réinitialiser le watchdog avant de démarrer la boucle de lecture
-  esp_task_wdt_reset();
-  
-  // Lire le reste des données disponibles
-  do {
-    // Vérifier si nous avons de la place pour un autre morceau
-    if (buffer_pos + chunk_size > this->http_buffer_size_) {
-      break;
-    }
-    
-    // Vérifier le timeout
-    if ((esp_timer_get_time() - start_time) / 1000 > read_timeout_ms) {
-      ESP_LOGW(TAG, "HTTP read timeout after %d chunks", total_chunks);
-      read_timed_out = true;
-      break;
-    }
-    
-    // Lire un morceau de données
-    read_len = esp_http_client_read(client, (char*)(this->http_buffer_ + buffer_pos), 
-                                  std::min(chunk_size, this->http_buffer_size_ - buffer_pos));
-    
-    if (read_len > 0) {
-      buffer_pos += read_len;
-      total_chunks++;
-      
-      // Réinitialiser le watchdog tous les quelques morceaux
-      if (total_chunks % 10 == 0) {
-        esp_task_wdt_reset();
-        // Céder brièvement aux autres tâches
-        vTaskDelay(pdMS_TO_TICKS(1));
-      }
-    }
-  } while (read_len > 0 && buffer_pos < this->http_buffer_size_);
-  
-  this->http_buffer_pos_ = 0;  // Position de lecture dans le buffer
-  this->http_buffer_size_used_ = buffer_pos;
-  
-  ESP_LOGI(TAG, "Read %d bytes of HTTP data in %d chunks%s", 
-           buffer_pos, total_chunks, read_timed_out ? " (timed out)" : "");
-  
-  esp_http_client_close(client);
-  
-  // Sauter le nettoyage explicite du client car notre unique_ptr s'en chargera
-  
-  ESP_LOGI(TAG, "HTTP video source initialized successfully");
-  return true;
 }
 
 bool VideoPlayerComponent::read_next_frame() {
@@ -705,133 +612,48 @@ bool VideoPlayerComponent::process_frame(const uint8_t* jpeg_data, size_t jpeg_s
   return conversion_success;
 }
 
-void VideoPlayer::loop() {
-  if (!this->enabled_ || this->is_playing_) return;
-
-  this->is_playing_ = true;
-
-  esp_http_client_config_t config = {
-    .url = this->video_url_.c_str(),
-    .timeout_ms = 5000,
-    .buffer_size = 16 * 1024,
-    .event_handler = http_event_handler,
-    .user_data = this
-  };
-
-  esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (client == nullptr) {
-    ESP_LOGE(TAG, "Échec init client HTTP");
-    this->is_playing_ = false;
-    return;
-  }
-
-  esp_err_t err = esp_http_client_open(client, 0);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Erreur ouverture HTTP: %s", esp_err_to_name(err));
-    esp_http_client_cleanup(client);
-    this->is_playing_ = false;
-    return;
-  }
-
-  int content_length = esp_http_client_fetch_headers(client);
-  if (content_length <= 0) {
-    ESP_LOGW(TAG, "Longueur de contenu inconnue ou nulle");
-  }
-
-  uint8_t header_buf[4];
-  int read = esp_http_client_read(client, (char *) header_buf, 4);
-  if (read != 4) {
-    ESP_LOGE(TAG, "Impossible de lire signature");
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    this->is_playing_ = false;
-    return;
-  }
-
-  bool is_custom_mjpeg = false;
-  if (memcmp(header_buf, "MJPG", 4) == 0) {
-    ESP_LOGI(TAG, "MJPEG personnalisé détecté");
-    is_custom_mjpeg = true;
-  } else if (header_buf[0] == 0xFF && header_buf[1] == 0xD8) {
-    ESP_LOGI(TAG, "MJPEG brut détecté (flux JPEG)");
-    is_custom_mjpeg = false;
-  } else {
-    ESP_LOGE(TAG, "Signature MJPEG invalide: 0x%02X%02X%02X%02X", header_buf[0], header_buf[1], header_buf[2], header_buf[3]);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    this->is_playing_ = false;
-    return;
-  }
-
-  if (!is_custom_mjpeg) {
-    // Lecture brute de JPEGs en boucle
-    const int max_frame_size = 60 * 1024;
-    uint8_t *jpeg_buf = (uint8_t *) malloc(max_frame_size);
-
-    if (!jpeg_buf) {
-      ESP_LOGE(TAG, "Échec allocation JPEG");
-      esp_http_client_close(client);
-      esp_http_client_cleanup(client);
-      this->is_playing_ = false;
+void VideoPlayerComponent::loop() {
+  const uint32_t now = millis();
+  
+  // Vérifier si HTTP a besoin d'initialisation
+  if (this->source_ == VideoSource::HTTP && !this->http_initialized_) {
+    if (now - last_http_init_attempt_ > 5000) { // Essayer toutes les 5 secondes
+      last_http_init_attempt_ = now;
+      if (this->open_http_source()) {
+        this->http_initialized_ = true;
+        ESP_LOGI(TAG, "HTTP source initialized successfully");
+      } else {
+        ESP_LOGW(TAG, "HTTP initialization deferred, will retry");
+        return;
+      }
+    } else {
+      // Pas encore le moment de réessayer
       return;
     }
-
-    int pos = 0;
-    jpeg_buf[0] = header_buf[0];
-    jpeg_buf[1] = header_buf[1];
-    pos = 2;
-
-    while (true) {
-      char c;
-      int r = esp_http_client_read(client, &c, 1);
-      if (r <= 0) break;
-
-      jpeg_buf[pos++] = c;
-      if (pos >= 2 && jpeg_buf[pos - 2] == 0xFF && jpeg_buf[pos - 1] == 0xD9) {
-        // FIN JPEG
-        jpg2rgb565(jpeg_buf, pos, this->frame_buffer_, JPG_SCALE_NONE);
-        this->display_->draw(this->frame_buffer_);
-        pos = 0;
-        delay(this->frame_delay_);
-      }
-
-      if (pos >= max_frame_size - 1) pos = 0; // évite dépassement
-    }
-
-    free(jpeg_buf);
-  } else {
-    // Format MJPEG personnalisé
-    while (true) {
-      mjpeg_frame_header_t frame_header;
-      int r = esp_http_client_read(client, (char *) &frame_header, sizeof(frame_header));
-      if (r <= 0) break;
-      if (frame_header.size == 0 || frame_header.size > 100 * 1024) break;
-
-      uint8_t *jpeg_buf = (uint8_t *) malloc(frame_header.size);
-      if (!jpeg_buf) break;
-
-      int received = 0;
-      while (received < frame_header.size) {
-        int chunk = esp_http_client_read(client, (char *) jpeg_buf + received, frame_header.size - received);
-        if (chunk <= 0) break;
-        received += chunk;
-      }
-
-      if (received == frame_header.size) {
-        jpg2rgb565(jpeg_buf, frame_header.size, this->frame_buffer_, JPG_SCALE_NONE);
-        this->display_->draw(this->frame_buffer_);
-        delay(this->frame_delay_);
-      }
-
-      free(jpeg_buf);
+  }
+  
+  if (now - last_update_ < update_interval_) {
+    return;
+  }
+  last_update_ = now;
+  
+  // Cession de tâche plus longue pour éviter d'affamer la pile réseau
+  vTaskDelay(pdMS_TO_TICKS(5));
+  
+  // Réinitialiser le watchdog avant le traitement du frame
+  esp_task_wdt_reset();
+  
+  if (read_next_frame()) {
+    display_->update();
+    this->current_frame_++;
+    
+    // Pour déboguer la mémoire
+    if (this->current_frame_ % 100 == 0) {
+      ESP_LOGI(TAG, "Memory - Free: %u bytes, Min Free: %u bytes",
+               esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     }
   }
-
-  esp_http_client_close(client);
-  esp_http_client_cleanup(client);
-  this->is_playing_ = false;
 }
-
 
 void VideoPlayerComponent::dump_info() {
   ESP_LOGCONFIG(TAG, "Video Player:");
@@ -848,5 +670,6 @@ void VideoPlayerComponent::dump_info() {
 
 }  // namespace video_player
 }  // namespace esphome
+
 
 
