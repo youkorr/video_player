@@ -51,6 +51,10 @@ typedef struct {
   uint32_t timestamp;    // Timestamp du frame en millisecondes
 } mjpeg_frame_header_t;
 
+// Constantes pour MJPEG
+constexpr uint32_t MJPEG_SIGNATURE = 0x47504A4D;  // "MJPG" en big-endian
+constexpr uint32_t JPEG_SIGNATURE = 0xE0FFD8FF;   // JPEG SOI + APP0 marker
+
 // Callback pour la lecture HTTP
 esp_err_t http_event_handler(esp_http_client_event_t *evt) {
   VideoPlayerComponent* player = static_cast<VideoPlayerComponent*>(evt->user_data);
@@ -58,6 +62,18 @@ esp_err_t http_event_handler(esp_http_client_event_t *evt) {
   switch(evt->event_id) {
     case HTTP_EVENT_ON_DATA:
       ESP_LOGV(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+      if (player->http_buffer_ != nullptr && player->http_buffer_size_allocated_ > 0) {
+        // Vérifier si nous avons assez d'espace
+        if (player->http_buffer_size_used_ + evt->data_len <= player->http_buffer_size_allocated_) {
+          // Copier les données dans notre buffer
+          memcpy(player->http_buffer_ + player->http_buffer_size_used_, evt->data, evt->data_len);
+          player->http_buffer_size_used_ += evt->data_len;
+          ESP_LOGD(TAG, "HTTP data received: %d bytes, total: %d", 
+                  evt->data_len, player->http_buffer_size_used_);
+        } else {
+          ESP_LOGW(TAG, "HTTP buffer full, discarding %d bytes", evt->data_len);
+        }
+      }
       break;
     case HTTP_EVENT_DISCONNECTED:
       ESP_LOGD(TAG, "HTTP_EVENT_DISCONNECTED");
@@ -139,6 +155,177 @@ void VideoPlayerComponent::cleanup() {
   }
 }
 
+// Fonction d'aide pour lire et vérifier les valeurs d'entête
+uint32_t read_uint32_safe(const uint8_t* buffer, size_t max_size, size_t offset, uint32_t* value) {
+  if (offset + sizeof(uint32_t) > max_size) {
+    return 0;
+  }
+  
+  memcpy(value, buffer + offset, sizeof(uint32_t));
+  return sizeof(uint32_t);
+}
+
+bool VideoPlayerComponent::parse_mjpeg_header(const uint8_t* buffer, size_t buffer_size) {
+  // Vérifier si nous avons assez de données pour l'en-tête
+  if (buffer_size < sizeof(mjpeg_header_t)) {
+    ESP_LOGE(TAG, "Buffer too small for MJPEG header: %d bytes", buffer_size);
+    return false;
+  }
+  
+  // Examiner les premiers octets pour détecter le format
+  ESP_LOGI(TAG, "Header bytes: %02X %02X %02X %02X", 
+           buffer[0], buffer[1], buffer[2], buffer[3]);
+  
+  // Vérifier si c'est un JPEG standard (commence par FF D8)
+  bool is_standard_jpeg = (buffer[0] == 0xFF && buffer[1] == 0xD8);
+  
+  if (is_standard_jpeg) {
+    ESP_LOGI(TAG, "Detected standard JPEG stream, not an MJPEG container");
+    
+    // Pour un JPEG standard, nous devons extraire la résolution à partir des marqueurs
+    // Chercher le marqueur SOF0 (Start Of Frame) qui contient les dimensions
+    size_t pos = 2;  // Sauter FF D8
+    
+    while (pos + 8 < buffer_size) {  // Besoin d'au moins 8 octets pour un marqueur
+      if (buffer[pos] == 0xFF && (buffer[pos+1] >= 0xC0 && buffer[pos+1] <= 0xCF && buffer[pos+1] != 0xC4 && buffer[pos+1] != 0xC8)) {
+        // Trouvé un marqueur SOF
+        uint16_t segment_len = (buffer[pos+2] << 8) | buffer[pos+3];
+        
+        // Hauteur et largeur sont à +5 et +7 du début du segment
+        if (pos + 8 < buffer_size) {
+          uint16_t height = (buffer[pos+5] << 8) | buffer[pos+6];
+          uint16_t width = (buffer[pos+7] << 8) | buffer[pos+8];
+          
+          if (width > 0 && width <= 4096 && height > 0 && height <= 4096) {
+            this->video_width_ = width;
+            this->video_height_ = height;
+            this->frame_count_ = 1;  // Une seule image
+            this->video_fps_ = 30;   // FPS par défaut
+            
+            ESP_LOGI(TAG, "JPEG dimensions extracted: %dx%d", width, height);
+            return true;
+          }
+        }
+        break;
+      }
+      
+      // Passer au segment suivant
+      if (buffer[pos+1] == 0xD8 || buffer[pos+1] == 0xD9) {
+        pos += 2;  // SOI et EOI n'ont pas de longueur
+      } else {
+        uint16_t segment_len = (buffer[pos+2] << 8) | buffer[pos+3];
+        pos += 2 + segment_len;
+      }
+    }
+    
+    // Si on ne peut pas extraire les dimensions, utiliser des valeurs par défaut raisonnables
+    this->video_width_ = 320;
+    this->video_height_ = 240;
+    this->frame_count_ = 1;
+    this->video_fps_ = 30;
+    
+    ESP_LOGW(TAG, "Could not extract JPEG dimensions, using defaults: %dx%d", 
+             this->video_width_, this->video_height_);
+    return true;
+  } else {
+    // Essayer de traiter comme un conteneur MJPEG
+    mjpeg_header_t header;
+    memcpy(&header, buffer, sizeof(header));
+    
+    ESP_LOGI(TAG, "Detected MJPEG container, signature: 0x%08X", header.signature);
+    
+    // Vérifier différentes signatures possibles (endianness différentes)
+    if (header.signature != MJPEG_SIGNATURE && 
+        header.signature != __builtin_bswap32(MJPEG_SIGNATURE) &&
+        header.signature != 0xFEFFD8FF) {
+        
+      ESP_LOGW(TAG, "Unknown MJPEG signature: 0x%08X", header.signature);
+      
+      // Essayer d'extraire une structure cohérente
+      uint32_t width = header.width;
+      uint32_t height = header.height;
+      
+      // Vérifier et corriger les dimensions
+      if (width > 4096 || width == 0) {
+        width = __builtin_bswap32(width);
+        if (width > 4096 || width == 0) {
+          width = 320;  // Valeur par défaut
+        }
+      }
+      
+      if (height > 4096 || height == 0) {
+        height = __builtin_bswap32(height);
+        if (height > 4096 || height == 0) {
+          height = 240;  // Valeur par défaut
+        }
+      }
+      
+      // Corriger le nombre de frames et le FPS
+      uint32_t frame_count = header.frame_count;
+      if (frame_count == 0 || frame_count > 10000) {
+        frame_count = __builtin_bswap32(frame_count);
+        if (frame_count == 0 || frame_count > 10000) {
+          frame_count = 100;  // Valeur par défaut
+        }
+      }
+      
+      uint32_t fps = header.fps;
+      if (fps == 0 || fps > 120) {
+        fps = __builtin_bswap32(fps);
+        if (fps == 0 || fps > 120) {
+          fps = 30;  // Valeur par défaut
+        }
+      }
+      
+      this->video_width_ = width;
+      this->video_height_ = height;
+      this->frame_count_ = frame_count;
+      this->video_fps_ = fps;
+      
+      ESP_LOGI(TAG, "Using adjusted values: %dx%d, %d frames, %d FPS",
+              width, height, frame_count, fps);
+      return true;
+    } else {
+      // Vérifier si on doit swapper les octets
+      if (header.signature == __builtin_bswap32(MJPEG_SIGNATURE)) {
+        header.width = __builtin_bswap32(header.width);
+        header.height = __builtin_bswap32(header.height);
+        header.frame_count = __builtin_bswap32(header.frame_count);
+        header.fps = __builtin_bswap32(header.fps);
+      }
+      
+      // Vérifier les valeurs
+      if (header.width == 0 || header.width > 4096 || 
+          header.height == 0 || header.height > 4096) {
+        ESP_LOGW(TAG, "Invalid dimensions: %dx%d, using defaults", header.width, header.height);
+        header.width = 320;
+        header.height = 240;
+      }
+      
+      if (header.frame_count == 0 || header.frame_count > 10000) {
+        ESP_LOGW(TAG, "Invalid frame count: %d, using default", header.frame_count);
+        header.frame_count = 100;
+      }
+      
+      if (header.fps == 0 || header.fps > 120) {
+        ESP_LOGW(TAG, "Invalid FPS: %d, using default", header.fps);
+        header.fps = 30;
+      }
+      
+      this->video_width_ = header.width;
+      this->video_height_ = header.height;
+      this->frame_count_ = header.frame_count;
+      this->video_fps_ = header.fps;
+      
+      ESP_LOGI(TAG, "MJPEG header parsed: %dx%d, %d frames, %d FPS",
+              this->video_width_, this->video_height_, this->frame_count_, this->video_fps_);
+      return true;
+    }
+  }
+  
+  return false;
+}
+
 bool VideoPlayerComponent::open_file_source() {
   // Initialiser le système de fichiers
   esp_vfs_spiffs_conf_t conf = {
@@ -162,30 +349,28 @@ bool VideoPlayerComponent::open_file_source() {
     return false;
   }
   
-  // Lire l'en-tête MJPEG
-  mjpeg_header_t header;
-  size_t read_size = fread(&header, 1, sizeof(header), video_file);
-  if (read_size != sizeof(header)) {
-    ESP_LOGE(TAG, "Failed to read MJPEG header");
+  // Lire les premiers octets pour analyse
+  uint8_t header_buffer[256];  // Buffer plus grand pour l'analyse
+  size_t read_size = fread(header_buffer, 1, sizeof(header_buffer), video_file);
+  if (read_size < 20) {  // Au moins quelques octets pour tester
+    ESP_LOGE(TAG, "Failed to read file header");
     fclose(video_file);
     return false;
   }
   
-  // Vérifier la signature
-  if (header.signature != 0xFEFFD8FF) {  // "MJPG" en little-endian
-    ESP_LOGE(TAG, "Invalid MJPEG signature");
+  // Analyser l'en-tête
+  if (!parse_mjpeg_header(header_buffer, read_size)) {
+    ESP_LOGE(TAG, "Failed to parse video header");
     fclose(video_file);
     return false;
   }
   
-  this->video_width_ = header.width;
-  this->video_height_ = header.height;
-  this->frame_count_ = header.frame_count;
-  this->video_fps_ = header.fps;
+  // Revenir au début du fichier
+  fseek(video_file, 0, SEEK_SET);
   this->video_file_ = video_file;
   
   // Calculer l'intervalle entre les frames basé sur le FPS
-  if (this->update_interval_ == 0) {
+  if (this->update_interval_ == 0 && this->video_fps_ > 0) {
     this->update_interval_ = 1000 / this->video_fps_;
   }
   
@@ -211,13 +396,6 @@ bool VideoPlayerComponent::open_http_source() {
     return false;
   }
 
-  // Ajouter une vérification d'activité WebDAV
-  bool webdav_active = false;  // Remplacer par une vérification réelle si possible
-  if (webdav_active) {
-    ESP_LOGW(TAG, "WebDAV transfer in progress, deferring video initialization");
-    return false;
-  }
-  
   // Acquérir le mutex réseau avec un pattern RAII
   bool mutex_acquired = false;
   if (xSemaphoreTake(this->network_mutex_, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -247,18 +425,37 @@ bool VideoPlayerComponent::open_http_source() {
              IP2STR(&ip_info.ip), IP2STR(&ip_info.gw));
   }
 
-  // Utiliser une taille de buffer plus petite pour réduire le risque de fragmentation
-  const size_t http_chunk_size = 4096;
+  // Allouer un buffer HTTP suffisamment grand mais pas trop pour éviter la fragmentation
+  const size_t http_buffer_size = 1024 * 1024;  // 1MB
   
-  // Configuration HTTP avec plus de robustesse
+  if (this->http_buffer_ != nullptr) {
+    heap_caps_free(this->http_buffer_);
+    this->http_buffer_ = nullptr;
+  }
+  
+  this->http_buffer_ = (uint8_t*)heap_caps_malloc(http_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!this->http_buffer_) {
+    ESP_LOGW(TAG, "Failed to allocate from SPIRAM, trying internal memory");
+    this->http_buffer_ = (uint8_t*)heap_caps_malloc(http_buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!this->http_buffer_) {
+      ESP_LOGE(TAG, "Failed to allocate HTTP buffer");
+      return false;
+    }
+  }
+  
+  this->http_buffer_size_allocated_ = http_buffer_size;
+  this->http_buffer_size_used_ = 0;
+  this->http_buffer_pos_ = 0;
+
+  // Configuration HTTP améliorée
   esp_http_client_config_t config = {};
   config.url = this->http_url_;
   config.event_handler = http_event_handler;
   config.user_data = this;
-  config.timeout_ms = 5000;
-  config.buffer_size = http_chunk_size;
+  config.timeout_ms = 10000;  // Augmenter le timeout pour un téléchargement plus fiable
+  config.buffer_size = 4096;  // Taille de chunk pour les données
   config.disable_auto_redirect = false;
-  config.skip_cert_common_name_check = true;  // Plus tolérant pour HTTPS
+  config.skip_cert_common_name_check = true;
   
   // Initialisation client avec gestion d'erreur
   esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -298,103 +495,53 @@ bool VideoPlayerComponent::open_http_source() {
     return false;
   }
   
-  if (content_length <= 0) {
-    ESP_LOGW(TAG, "Content length unknown or zero, proceeding cautiously");
-  }
+  // Lire les données dans notre buffer
+  int read_len;
+  int total_read = 0;
+  const int max_read = this->http_buffer_size_allocated_;
   
-  // Lire l'en-tête avec plus de diagnostics
-  size_t initial_buffer_size = 8192;
-  uint8_t* header_buffer = (uint8_t*)heap_caps_malloc(initial_buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!header_buffer) {
-    ESP_LOGW(TAG, "Failed to allocate from internal memory, trying SPIRAM");
-    header_buffer = (uint8_t*)heap_caps_malloc(initial_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!header_buffer) {
-      ESP_LOGE(TAG, "Failed to allocate HTTP buffer");
-      esp_http_client_close(client);
-      return false;
-    }
-  }
-  
-  // RAII pour le buffer
-  auto buffer_guard = std::unique_ptr<uint8_t, std::function<void(uint8_t*)>>(
-    header_buffer,
-    [](uint8_t* ptr) {
-      if (ptr != nullptr) {
-        heap_caps_free(ptr);
-      }
-    }
-  );
-  
-  // Timeout et diagnostic améliorés pour la lecture
-  const int read_timeout_ms = 5000;
-  int64_t start_time = esp_timer_get_time();
-  
-  // Lire l'en-tête MJPEG avec plus de diagnostics
-  int read_len = esp_http_client_read(client, (char*)header_buffer, sizeof(mjpeg_header_t));
-  if (read_len != sizeof(mjpeg_header_t)) {
-    ESP_LOGE(TAG, "Failed to read MJPEG header from HTTP (got %d bytes, expected %d)",
-             read_len, sizeof(mjpeg_header_t));
+  while ((read_len = esp_http_client_read(client, (char*)this->http_buffer_ + total_read, 
+                                          max_read - total_read)) > 0) {
+    total_read += read_len;
+    ESP_LOGD(TAG, "Read %d bytes, total: %d", read_len, total_read);
     
-    // Afficher les premiers octets pour le débogage
-    if (read_len > 0) {
-      char hex_dump[100] = {0};
-      char *ptr = hex_dump;
-      for (int i = 0; i < std::min(read_len, 16); i++) {
-        ptr += sprintf(ptr, "%02X ", header_buffer[i]);
-      }
-      ESP_LOGE(TAG, "First bytes: %s", hex_dump);
-      
-      // Vérifier si c'est potentiellement un JPEG standard
-      if (read_len >= 2 && header_buffer[0] == 0xFF && header_buffer[1] == 0xD8) {
-        ESP_LOGW(TAG, "Detected standard JPEG data instead of MJPEG container");
-      }
-    }
+    // Réinitialiser le watchdog pendant le téléchargement
+    esp_task_wdt_reset();
     
-    esp_http_client_close(client);
+    // Vérifier si le buffer est plein
+    if (total_read >= max_read) {
+      ESP_LOGW(TAG, "HTTP buffer full after %d bytes", total_read);
+      break;
+    }
+  }
+  
+  this->http_buffer_size_used_ = total_read;
+  ESP_LOGI(TAG, "Total read: %d bytes", total_read);
+  
+  if (total_read < 20) {  // Un minimum pour l'en-tête
+    ESP_LOGE(TAG, "Not enough data received from HTTP");
     return false;
   }
   
-  // Réinitialiser le timer
-  esp_task_wdt_reset();
-  
-  // Analyser l'en-tête avec plus de tolérance
-  mjpeg_header_t* header = (mjpeg_header_t*)header_buffer;
-  ESP_LOGI(TAG, "Signature reçue: 0x%08X (attendue: 0x47504A4D)", header->signature);
-  
-  // Signature MJPEG alternative possible
-  static const uint32_t MJPEG_SIGNATURE_ALT = 0x4A504547;  // "JPEG"
-  
-  if (header->signature != 0xFEFFD8FF && header->signature != MJPEG_SIGNATURE_ALT) {
-    ESP_LOGE(TAG, "Invalid MJPEG signature from HTTP: 0x%08X", header->signature);
-    esp_http_client_close(client);
+  // Essayer de parser l'en-tête
+  if (!parse_mjpeg_header(this->http_buffer_, this->http_buffer_size_used_)) {
+    ESP_LOGE(TAG, "Failed to parse video header from HTTP");
     return false;
   }
   
-  // Validation des paramètres d'en-tête avec valeurs par défaut
-  if (header->width == 0 || header->height == 0 || 
-      header->width > 4096 || header->height > 4096) {
-    ESP_LOGE(TAG, "Invalid video dimensions: %dx%d", header->width, header->height);
-    esp_http_client_close(client);
-    return false;
+  // Commencer la lecture après l'en-tête (20 octets minimum, ou la taille standard d'un en-tête MJPEG)
+  this->http_buffer_pos_ = sizeof(mjpeg_header_t);
+  
+  // Calculer l'intervalle entre les frames basé sur le FPS
+  if (this->update_interval_ == 0 && this->video_fps_ > 0) {
+    this->update_interval_ = 1000 / this->video_fps_;
   }
   
-  if (header->frame_count == 0 || header->fps == 0 || header->fps > 120) {
-    ESP_LOGW(TAG, "Suspicious video parameters: %d frames, %d FPS - using defaults", 
-             header->frame_count, header->fps);
-    // Utiliser des valeurs par défaut si nécessaire
-    if (header->frame_count == 0) header->frame_count = 100;
-    if (header->fps == 0 || header->fps > 120) header->fps = 30;
-  }
+  // Fermer la connexion HTTP
+  esp_http_client_close(client);
   
-  this->video_width_ = header->width;
-  this->video_height_ = header->height;
-  this->frame_count_ = header->frame_count;
-  this->video_fps_ = header->fps;
-  
-  ESP_LOGI(TAG, "Video parameters: %dx%d, %d frames, %d FPS", 
-           this->video_width_, this->video_height_, this->frame_count_, this->video_fps_);
+  return true;
 }
-
 bool VideoPlayerComponent::read_next_frame() {
   if (this->source_ == VideoSource::FILE) {
     if (!this->video_file_) {
