@@ -3,7 +3,7 @@
 #include "esphome/core/component.h"
 #include "esphome/components/display/display.h"
 
-// Include FreeRTOS header for mutex
+// Include necessary ESP-IDF libraries
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -17,30 +17,20 @@ enum class VideoSource {
 
 class VideoPlayerComponent : public Component {
  public:
-  VideoPlayerComponent() : Component() {}
+  VideoPlayerComponent() = default;
   ~VideoPlayerComponent();
   
   void setup() override;
   void loop() override;
-  void dump_info() override;
   
-  void set_display(display::Display *display) { display_ = display; }
-  void set_update_interval(uint32_t update_interval) { update_interval_ = update_interval; }
+  // Remove the 'override' keyword here since it's not overriding a parent method
+  void dump_info();
   
-  // Configuration pour source fichier
-  void set_video_path(const char* path) { 
-    video_path_ = path; 
-    source_ = VideoSource::FILE;
-  }
-  
-  // Configuration pour source HTTP
-  void set_http_url(const char* url) { 
-    http_url_ = url; 
-    source_ = VideoSource::HTTP;
-  }
-  
-  // Option pour boucler la vidéo
-  void set_loop(bool loop) { loop_video_ = loop; }
+  void set_display(display::Display *display) { this->display_ = display; }
+  void set_video_path(const char *path) { this->video_path_ = path; this->source_ = VideoSource::FILE; }
+  void set_http_url(const char *url) { this->http_url_ = url; this->source_ = VideoSource::HTTP; }
+  void set_update_interval(uint32_t interval) { this->update_interval_ = interval; }
+  void set_loop_video(bool loop) { this->loop_video_ = loop; }
   
  protected:
   bool open_file_source();
@@ -50,40 +40,32 @@ class VideoPlayerComponent : public Component {
   void init_mutex();
   void cleanup();
   
-  // Propriétés de l'affichage
   display::Display *display_{nullptr};
+  const char *video_path_{nullptr};
+  const char *http_url_{nullptr};
+  FILE *video_file_{nullptr};
   
-  // Source vidéo
-  VideoSource source_{VideoSource::FILE};
-  const char* video_path_{nullptr};
-  const char* http_url_{nullptr};
-  
-  // Gestion du fichier
-  FILE* video_file_{nullptr};
-  bool spiffs_mounted_{false};
-  
-  // Buffer HTTP pour la lecture en streaming
-  uint8_t* http_buffer_{nullptr};
-  size_t http_buffer_size_{0};
-  size_t http_buffer_pos_{0};
-  size_t http_buffer_size_used_{0};  // Taille utilisée dans le buffer
-  
-  // Synchronisation
-  SemaphoreHandle_t network_mutex_{nullptr};
-  
-  // Propriétés de la vidéo
   uint32_t video_width_{0};
   uint32_t video_height_{0};
   uint32_t frame_count_{0};
   uint32_t video_fps_{0};
   uint32_t current_frame_{0};
   
-  // Gestion du timing
-  uint32_t update_interval_{0};
+  uint32_t update_interval_{0};  // Milliseconds
   uint32_t last_update_{0};
   
-  // Options
+  VideoSource source_{VideoSource::FILE};
   bool loop_video_{true};
+  bool spiffs_mounted_{false};
+  
+  // HTTP buffer
+  uint8_t *http_buffer_{nullptr};
+  size_t http_buffer_size_{0};
+  size_t http_buffer_size_used_{0};
+  size_t http_buffer_pos_{0};
+  
+  // Mutex for network operations
+  SemaphoreHandle_t network_mutex_{nullptr};
 };
 
 }  // namespace video_player
