@@ -16,14 +16,7 @@
 #include "esp_jpg_decode.h"
 
 // Déclaration pour jpg2rgb565 si non déclaré ailleurs
-#ifndef JPG_SCALE_NONE
-typedef enum {
-  JPG_SCALE_NONE,
-  JPG_SCALE_2X,
-  JPG_SCALE_4X,
-  JPG_SCALE_8X,
-} jpg_scale_t;
-
+#ifndef jpg2rgb565
 extern "C" {
   bool jpg2rgb565(const uint8_t *src, size_t src_len, uint8_t *out, jpg_scale_t scale);
 }
@@ -425,3 +418,4 @@ void VideoPlayerComponent::dump_info() {
 
 }  // namespace video_player
 }  // namespace esphome
+
