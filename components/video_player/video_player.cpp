@@ -172,7 +172,7 @@ bool VideoPlayerComponent::open_file_source() {
   }
   
   // Vérifier la signature
-  if (header.signature != 0x47504A4D) {  // "MJPG" en little-endian
+  if (header.signature != 0xFEFFD8FF) {  // "MJPG" en little-endian
     ESP_LOGE(TAG, "Invalid MJPEG signature");
     fclose(video_file);
     return false;
