@@ -8,6 +8,8 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_task_wdt.h"
+#include "esp_timer.h"
+#include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -15,6 +17,9 @@
 // Pour la lecture du fichier MJPEG
 #include <stdio.h>
 #include <string.h>
+#include <functional>
+#include <memory>
+#include <algorithm>
 
 // Ajout de l'inclusion pour jpg2rgb565
 #include "esp_jpg_decode.h"
@@ -76,20 +81,20 @@ void VideoPlayerComponent::setup() {
   // Initialiser les mutex pour la synchronisation
   this->init_mutex();
   
+  // Ne pas échouer immédiatement avec la source HTTP, nous réessaierons dans loop
   if (this->source_ == VideoSource::FILE) {
     if (!this->open_file_source()) {
       this->mark_failed();
       return;
     }
+    ESP_LOGI(TAG, "Video loaded: %dx%d, %d frames, %d FPS", 
+             this->video_width_, this->video_height_, this->frame_count_, this->video_fps_);
   } else if (this->source_ == VideoSource::HTTP) {
-    if (!this->open_http_source()) {
-      this->mark_failed();
-      return;
-    }
+    // Juste journaliser que nous initialiserons plus tard
+    ESP_LOGI(TAG, "HTTP source set, will initialize when network is available");
+    this->http_initialized_ = false;
   }
   
-  ESP_LOGI(TAG, "Video loaded: %dx%d, %d frames, %d FPS", 
-           this->video_width_, this->video_height_, this->frame_count_, this->video_fps_);
   ESP_LOGI(TAG, "Display dimensions: %dx%d", display_->get_width(), display_->get_height());
 }
 
@@ -193,78 +198,136 @@ bool VideoPlayerComponent::open_http_source() {
     return false;
   }
   
-  // Vérifier que nous avons le mutex pour les opérations réseau
-  if (xSemaphoreTake(this->network_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+  // Vérifier que le réseau est initialisé avant de continuer
+  if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == NULL) {
+    ESP_LOGW(TAG, "Network interface not ready, deferring HTTP initialization");
+    // Programmer une nouvelle tentative dans la prochaine itération plutôt que d'échouer
+    return false;
+  }
+  
+  // Acquérir le mutex réseau avec un motif RAII plus sûr utilisant un unique_ptr
+  bool mutex_acquired = false;
+  if (xSemaphoreTake(this->network_mutex_, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    mutex_acquired = true;
+  } else {
     ESP_LOGE(TAG, "Failed to acquire network mutex");
     return false;
   }
   
+  // Créer un gestionnaire de nettoyage pour s'assurer que le mutex est libéré
+  auto mutex_guard = std::unique_ptr<bool, std::function<void(bool*)>>(
+    &mutex_acquired,
+    [this](bool* acquired) {
+      if (*acquired) {
+        xSemaphoreGive(this->network_mutex_);
+      }
+    }
+  );
+  
   ESP_LOGI(TAG, "Connecting to HTTP source: %s", this->http_url_);
 
+  // Utiliser une taille de buffer plus petite pour réduire le risque de fragmentation de la mémoire
+  const size_t http_chunk_size = 4096;  // Morceaux de 4 Ko au lieu de grands tampons
+  
   // Configuration du client HTTP
   esp_http_client_config_t config = {};
   config.url = this->http_url_;
   config.event_handler = http_event_handler;
   config.user_data = this;
-  config.timeout_ms = 10000;
-  config.buffer_size = 4096;  // Buffer plus petit pour éviter la fragmentation
+  config.timeout_ms = 5000;  // Timeout réduit
+  config.buffer_size = http_chunk_size;  // Taille de buffer plus petite
   config.disable_auto_redirect = false;
   
+  // Ajouter la gestion des erreurs pour l'initialisation du client
   esp_http_client_handle_t client = esp_http_client_init(&config);
   if (client == NULL) {
     ESP_LOGE(TAG, "Failed to initialize HTTP client");
-    xSemaphoreGive(this->network_mutex_);
     return false;
   }
+  
+  // Utilisation de unique_ptr avec un destructeur personnalisé pour un nettoyage approprié
+  auto http_client_guard = std::unique_ptr<esp_http_client_handle_t, std::function<void(esp_http_client_handle_t*)>>(
+    &client,
+    [](esp_http_client_handle_t* client) {
+      if (*client != NULL) {
+        esp_http_client_cleanup(*client);
+      }
+    }
+  );
+  
+  // Réinitialiser le timer watchdog avant les opérations longues
+  esp_task_wdt_reset();
   
   // Télécharger l'en-tête MJPEG
   esp_err_t err = esp_http_client_open(client, 0);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-    esp_http_client_cleanup(client);
-    xSemaphoreGive(this->network_mutex_);
     return false;
   }
   
+  // Utiliser un timeout plus petit pour récupérer les headers
+  int64_t start_time = esp_timer_get_time();
   int content_length = esp_http_client_fetch_headers(client);
   if (content_length < 0) {
     ESP_LOGE(TAG, "HTTP client fetch headers failed");
     esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    xSemaphoreGive(this->network_mutex_);
     return false;
   }
   
-  // Allouer de la mémoire pour le buffer HTTP - taille réduite
-  size_t buffer_size = 65536;  // 64KB buffer (réduit de 256KB)
-  uint8_t* buffer = (uint8_t*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!buffer) {
-    ESP_LOGE(TAG, "Failed to allocate HTTP buffer");
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    xSemaphoreGive(this->network_mutex_);
-    return false;
+  // Utiliser une taille de buffer plus raisonnable et mieux gérer l'échec d'allocation
+  size_t initial_buffer_size = 8192;  // Commencer avec 8 Ko
+  uint8_t* header_buffer = (uint8_t*)heap_caps_malloc(initial_buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!header_buffer) {
+    ESP_LOGW(TAG, "Failed to allocate from internal memory, trying SPIRAM");
+    header_buffer = (uint8_t*)heap_caps_malloc(initial_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!header_buffer) {
+      ESP_LOGE(TAG, "Failed to allocate HTTP buffer");
+      esp_http_client_close(client);
+      return false;
+    }
   }
+  
+  // Utiliser unique_ptr pour la gestion de la mémoire
+  auto buffer_guard = std::unique_ptr<uint8_t, std::function<void(uint8_t*)>>(
+    header_buffer,
+    [](uint8_t* ptr) {
+      if (ptr != nullptr) {
+        heap_caps_free(ptr);
+      }
+    }
+  );
+  
+  // Ajouter un timeout pour l'opération de lecture
+  const int read_timeout_ms = 5000;
+  start_time = esp_timer_get_time();
   
   // Lire l'en-tête MJPEG
-  int read_len = esp_http_client_read(client, (char*)buffer, sizeof(mjpeg_header_t));
+  int read_len = esp_http_client_read(client, (char*)header_buffer, sizeof(mjpeg_header_t));
   if (read_len != sizeof(mjpeg_header_t)) {
-    ESP_LOGE(TAG, "Failed to read MJPEG header from HTTP");
+    ESP_LOGE(TAG, "Failed to read MJPEG header from HTTP (got %d bytes, expected %d)",
+             read_len, sizeof(mjpeg_header_t));
     esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    heap_caps_free(buffer);
-    xSemaphoreGive(this->network_mutex_);
     return false;
   }
   
+  // Réinitialiser le timer watchdog pendant les opérations longues
+  esp_task_wdt_reset();
+  
   // Analyser l'en-tête
-  mjpeg_header_t* header = (mjpeg_header_t*)buffer;
+  mjpeg_header_t* header = (mjpeg_header_t*)header_buffer;
   if (header->signature != 0x47504A4D) {
     ESP_LOGE(TAG, "Invalid MJPEG signature from HTTP");
     esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    heap_caps_free(buffer);
-    xSemaphoreGive(this->network_mutex_);
+    return false;
+  }
+  
+  // Validation des paramètres d'en-tête
+  if (header->width == 0 || header->height == 0 || 
+      header->width > 4096 || header->height > 4096 ||
+      header->frame_count == 0 || header->fps == 0 || header->fps > 120) {
+    ESP_LOGE(TAG, "Invalid video parameters: %dx%d, %d frames, %d FPS", 
+             header->width, header->height, header->frame_count, header->fps);
+    esp_http_client_close(client);
     return false;
   }
   
@@ -273,16 +336,36 @@ bool VideoPlayerComponent::open_http_source() {
   this->frame_count_ = header->frame_count;
   this->video_fps_ = header->fps;
   
-  // On alloue maintenant le buffer HTTP avec la taille adéquate
-  heap_caps_free(buffer);
-  this->http_buffer_size_ = buffer_size;
+  // Utiliser une taille de buffer raisonnable basée sur la longueur du contenu et la mémoire disponible
+  size_t target_buffer_size = std::min((size_t)content_length, (size_t)65536);  // Max 64KB ou longueur du contenu
+  
+  // Vérifier la mémoire libre et ajuster la taille du buffer si nécessaire
+  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  ESP_LOGI(TAG, "Free memory - Internal: %u bytes, SPIRAM: %u bytes", free_internal, free_spiram);
+  
+  // Limiter la taille du buffer pour éviter les problèmes de mémoire
+  if (target_buffer_size > free_internal / 2 && target_buffer_size > free_spiram / 4) {
+    target_buffer_size = std::min(free_internal / 2, free_spiram / 4);
+    ESP_LOGW(TAG, "Limiting buffer size to %u bytes due to memory constraints", target_buffer_size);
+  }
+  
+  // Assurer une taille minimale viable
+  if (target_buffer_size < 8192) {
+    target_buffer_size = 8192;  // Minimum 8KB
+  }
+  
+  // Maintenant allouer le buffer HTTP réel
+  this->http_buffer_size_ = target_buffer_size;
   this->http_buffer_ = (uint8_t*)heap_caps_malloc(this->http_buffer_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!this->http_buffer_) {
-    ESP_LOGE(TAG, "Failed to allocate HTTP buffer");
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    xSemaphoreGive(this->network_mutex_);
-    return false;
+    ESP_LOGW(TAG, "Failed to allocate from SPIRAM, trying internal memory");
+    this->http_buffer_ = (uint8_t*)heap_caps_malloc(this->http_buffer_size_, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!this->http_buffer_) {
+      ESP_LOGE(TAG, "Failed to allocate HTTP buffer");
+      esp_http_client_close(client);
+      return false;
+    }
   }
   
   // Copier l'en-tête dans le buffer
@@ -294,24 +377,54 @@ bool VideoPlayerComponent::open_http_source() {
     this->update_interval_ = 1000 / this->video_fps_;
   }
   
+  // Lire les données en petits morceaux avec des timeouts
+  const size_t chunk_size = 4096;  // Morceaux de 4 Ko
+  int total_chunks = 0;
+  bool read_timed_out = false;
+  
+  // Réinitialiser le watchdog avant de démarrer la boucle de lecture
+  esp_task_wdt_reset();
+  
   // Lire le reste des données disponibles
   do {
+    // Vérifier si nous avons de la place pour un autre morceau
+    if (buffer_pos + chunk_size > this->http_buffer_size_) {
+      break;
+    }
+    
+    // Vérifier le timeout
+    if ((esp_timer_get_time() - start_time) / 1000 > read_timeout_ms) {
+      ESP_LOGW(TAG, "HTTP read timeout after %d chunks", total_chunks);
+      read_timed_out = true;
+      break;
+    }
+    
+    // Lire un morceau de données
     read_len = esp_http_client_read(client, (char*)(this->http_buffer_ + buffer_pos), 
-                                    this->http_buffer_size_ - buffer_pos);
+                                  std::min(chunk_size, this->http_buffer_size_ - buffer_pos));
+    
     if (read_len > 0) {
       buffer_pos += read_len;
-      ESP_LOGD(TAG, "Read %d bytes, total: %d", read_len, buffer_pos);
+      total_chunks++;
+      
+      // Réinitialiser le watchdog tous les quelques morceaux
+      if (total_chunks % 10 == 0) {
+        esp_task_wdt_reset();
+        // Céder brièvement aux autres tâches
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
     }
   } while (read_len > 0 && buffer_pos < this->http_buffer_size_);
   
   this->http_buffer_pos_ = 0;  // Position de lecture dans le buffer
   this->http_buffer_size_used_ = buffer_pos;
   
-  ESP_LOGI(TAG, "Read %d bytes of HTTP data", buffer_pos);
+  ESP_LOGI(TAG, "Read %d bytes of HTTP data in %d chunks%s", 
+           buffer_pos, total_chunks, read_timed_out ? " (timed out)" : "");
   
   esp_http_client_close(client);
-  esp_http_client_cleanup(client);
-  xSemaphoreGive(this->network_mutex_);
+  
+  // Sauter le nettoyage explicite du client car notre unique_ptr s'en chargera
   
   ESP_LOGI(TAG, "HTTP video source initialized successfully");
   return true;
@@ -400,6 +513,9 @@ bool VideoPlayerComponent::read_next_frame() {
       }
     }
     
+    // Réinitialiser le watchdog avant de traiter le frame
+    esp_task_wdt_reset();
+    
     // Lire l'en-tête du frame
     mjpeg_frame_header_t* frame_header = (mjpeg_frame_header_t*)(this->http_buffer_ + this->http_buffer_pos_);
     this->http_buffer_pos_ += sizeof(mjpeg_frame_header_t);
@@ -459,6 +575,16 @@ bool VideoPlayerComponent::process_frame(const uint8_t* jpeg_data, size_t jpeg_s
     }
   }
   
+  // Utiliser un unique_ptr pour garantir la libération de mémoire
+  auto rgb_buf_guard = std::unique_ptr<uint8_t, std::function<void(uint8_t*)>>(
+    rgb_buf,
+    [](uint8_t* ptr) {
+      if (ptr != nullptr) {
+        heap_caps_free(ptr);
+      }
+    }
+  );
+  
   // Déterminer l'échelle à utiliser
   jpg_scale_t scale = JPG_SCALE_NONE;
   
@@ -468,6 +594,9 @@ bool VideoPlayerComponent::process_frame(const uint8_t* jpeg_data, size_t jpeg_s
     scale = JPG_SCALE_2X;
     ESP_LOGD(TAG, "Using 2x downscaling for JPEG");
   }
+  
+  // Réinitialiser le watchdog avant la conversion JPEG
+  esp_task_wdt_reset();
   
   // Convertir JPEG en RGB565
   bool conversion_success = jpg2rgb565(jpeg_data, jpeg_size, rgb_buf, scale);
@@ -480,6 +609,9 @@ bool VideoPlayerComponent::process_frame(const uint8_t* jpeg_data, size_t jpeg_s
     // Calculer les facteurs de mise à l'échelle pour l'affichage
     float scale_x = (float)scaled_width / display_->get_width();
     float scale_y = (float)scaled_height / display_->get_height();
+    
+    // Réinitialiser le watchdog avant le rendu
+    esp_task_wdt_reset();
     
     // Dessiner sur l'écran
     for (int y = 0; y < (int)display_->get_height(); y++) {
@@ -511,21 +643,40 @@ bool VideoPlayerComponent::process_frame(const uint8_t* jpeg_data, size_t jpeg_s
     ESP_LOGE(TAG, "JPEG conversion failed");
   }
   
-  // Libérer la mémoire
-  heap_caps_free(rgb_buf);
-  
+  // rgb_buf sera automatiquement libéré par rgb_buf_guard
   return conversion_success;
 }
 
 void VideoPlayerComponent::loop() {
   const uint32_t now = millis();
+  
+  // Vérifier si HTTP a besoin d'initialisation
+  if (this->source_ == VideoSource::HTTP && !this->http_initialized_) {
+    if (now - last_http_init_attempt_ > 5000) { // Essayer toutes les 5 secondes
+      last_http_init_attempt_ = now;
+      if (this->open_http_source()) {
+        this->http_initialized_ = true;
+        ESP_LOGI(TAG, "HTTP source initialized successfully");
+      } else {
+        ESP_LOGW(TAG, "HTTP initialization deferred, will retry");
+        return;
+      }
+    } else {
+      // Pas encore le moment de réessayer
+      return;
+    }
+  }
+  
   if (now - last_update_ < update_interval_) {
     return;
   }
   last_update_ = now;
   
-  // Donner un peu de temps aux tâches réseau
-  vTaskDelay(1);
+  // Cession de tâche plus longue pour éviter d'affamer la pile réseau
+  vTaskDelay(pdMS_TO_TICKS(5));
+  
+  // Réinitialiser le watchdog avant le traitement du frame
+  esp_task_wdt_reset();
   
   if (read_next_frame()) {
     display_->update();
@@ -540,7 +691,6 @@ void VideoPlayerComponent::loop() {
 }
 
 void VideoPlayerComponent::dump_info() {
-  // Note: Removed 'override' in the header file
   ESP_LOGCONFIG(TAG, "Video Player:");
   ESP_LOGCONFIG(TAG, "  Resolution: %dx%d", this->video_width_, this->video_height_);
   ESP_LOGCONFIG(TAG, "  Frames: %d", this->frame_count_);
@@ -555,4 +705,5 @@ void VideoPlayerComponent::dump_info() {
 
 }  // namespace video_player
 }  // namespace esphome
+
 
