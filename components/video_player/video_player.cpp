@@ -364,7 +364,7 @@ bool VideoPlayerComponent::open_http_source() {
   // Signature MJPEG alternative possible
   static const uint32_t MJPEG_SIGNATURE_ALT = 0x4A504547;  // "JPEG"
   
-  if (header->signature != 0x47504A4D && header->signature != MJPEG_SIGNATURE_ALT) {
+  if (header->signature != 0xFEFFD8FF && header->signature != MJPEG_SIGNATURE_ALT) {
     ESP_LOGE(TAG, "Invalid MJPEG signature from HTTP: 0x%08X", header->signature);
     esp_http_client_close(client);
     return false;
