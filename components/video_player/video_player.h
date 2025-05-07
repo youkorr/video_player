@@ -16,7 +16,7 @@ class VideoPlayerComponent : public Component {
  public:
   void setup() override;
   void loop() override;
-  //void dump_info() override;
+  void dump_info(); // Removed override keyword
   
   void set_display(display::DisplayBuffer *display) { display_ = display; }
   void set_video_path(const char* path) { video_path_ = path; }
@@ -53,3 +53,4 @@ class VideoPlayerComponent : public Component {
 
 }  // namespace video_player
 }  // namespace esphome
+
