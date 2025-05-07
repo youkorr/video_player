@@ -540,6 +540,7 @@ void VideoPlayerComponent::loop() {
 }
 
 void VideoPlayerComponent::dump_info() {
+  // Note: Removed 'override' in the header file
   ESP_LOGCONFIG(TAG, "Video Player:");
   ESP_LOGCONFIG(TAG, "  Resolution: %dx%d", this->video_width_, this->video_height_);
   ESP_LOGCONFIG(TAG, "  Frames: %d", this->frame_count_);
